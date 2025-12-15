@@ -434,16 +434,24 @@ async def _convert_ugoira_to_gif(zip_data, metadata, safe_title, illust_id):
             str(output_gif)  # 输出文件
         ]
         
-        result = subprocess.run(
-            cmd,
-            cwd=temp_dir,
-            capture_output=True,
-            text=True,
-            timeout=60  # 60秒超时
+        # 使用 asyncio.create_subprocess_exec 替代 subprocess.run
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(temp_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         
-        if result.returncode != 0:
-            logger.error(f"Pixiv 插件：ffmpeg转换失败 - {result.stderr}")
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            logger.error("Pixiv 插件：ffmpeg转换超时")
+            return None
+
+        if process.returncode != 0:
+            logger.error(f"Pixiv 插件：ffmpeg转换失败 - {stderr.decode()}")
             return None
         
         if not output_gif.exists():

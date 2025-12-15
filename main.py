@@ -142,6 +142,10 @@ class PixivSearchPlugin(Star):
             )
             return False
 
+    async def _call_pixiv_api(self, func, *args, **kwargs):
+        """异步调用 Pixiv API 的辅助方法"""
+        return await asyncio.to_thread(func, *args, **kwargs)
+
     @command("pixiv")
     async def pixiv(self, event: AstrMessageEvent, tags: str = ""):
         """处理 /pixiv 命令，默认为标签搜索功能"""
@@ -178,7 +182,7 @@ class PixivSearchPlugin(Star):
         logger.info(f"Pixiv 插件：正在搜索标签 - {search_tags}，排除标签 - {exclude_tags}")
         try:
             # 包装同步搜索调用
-            search_result = await asyncio.to_thread(
+            search_result = await self._call_pixiv_api(
                 self.client.search_illust,
                 search_tags, 
                 search_target="partial_match_for_tags"
@@ -242,14 +246,14 @@ class PixivSearchPlugin(Star):
                 return
             
             # 获取画师信息
-            user_detail = await asyncio.to_thread(self.client.user_detail, int(artist_id))
+            user_detail = await self._call_pixiv_api(self.client.user_detail, int(artist_id))
             if user_detail and user_detail.user:
                 target_name = user_detail.user.name
             
             # 获取画师最新作品ID作为初始值
             latest_illust_id = 0
             try:
-                user_illusts = await asyncio.to_thread(self.client.user_illusts, int(artist_id))
+                user_illusts = await self._call_pixiv_api(self.client.user_illusts, int(artist_id))
                 if user_illusts and user_illusts.illusts:
                     latest_illust_id = user_illusts.illusts[0].id
                     logger.info(f"获取到画师 {artist_id} 的最新作品ID: {latest_illust_id}")
@@ -322,7 +326,7 @@ class PixivSearchPlugin(Star):
         logger.info("Pixiv 插件：获取推荐作品")
         try:
             # 调用 API 获取推荐
-            recommend_result = self.client.illust_recommended()
+            recommend_result = await self._call_pixiv_api(self.client.illust_recommended)
             initial_illusts = (
                 recommend_result.illusts if recommend_result.illusts else []
             )
@@ -429,7 +433,7 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 Pixiv API 获取排行榜
-            ranking_result = self.client.illust_ranking(mode=mode, date=date)
+            ranking_result = await self._call_pixiv_api(self.client.illust_ranking, mode=mode, date=date)
             initial_illusts = ranking_result.illusts if ranking_result.illusts else []
 
             if not initial_illusts:
@@ -487,7 +491,7 @@ class PixivSearchPlugin(Star):
         logger.info(f"Pixiv 插件：获取相关作品 - ID: {illust_id}")
         try:
             # 调用 API 获取相关作品
-            related_result = self.client.illust_related(int(illust_id))
+            related_result = await self._call_pixiv_api(self.client.illust_related, int(illust_id))
             initial_illusts = related_result.illusts if related_result.illusts else []
 
             if not initial_illusts:
@@ -541,7 +545,7 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 Pixiv API 搜索用户
-            json_result = self.client.search_user(username)
+            json_result = await self._call_pixiv_api(self.client.search_user, username)
             if (
                 not json_result
                 or not hasattr(json_result, "user_previews")
@@ -619,7 +623,7 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 Pixiv API 获取用户详情
-            json_result = self.client.user_detail(user_id)
+            json_result = await self._call_pixiv_api(self.client.user_detail, user_id)
             if not json_result or not hasattr(json_result, "user"):
                 yield event.plain_result(f"未找到用户 - ID: {user_id}")
                 return
@@ -676,7 +680,7 @@ class PixivSearchPlugin(Star):
 
         try:
             # 获取用户信息以显示用户名
-            user_detail_result = self.client.user_detail(int(user_id))
+            user_detail_result = await self._call_pixiv_api(self.client.user_detail, int(user_id))
             user_name = (
                 user_detail_result.user.name
                 if user_detail_result and user_detail_result.user
@@ -684,7 +688,7 @@ class PixivSearchPlugin(Star):
             )
 
             # 调用 API 获取用户作品
-            user_illusts_result = self.client.user_illusts(int(user_id))
+            user_illusts_result = await self._call_pixiv_api(self.client.user_illusts, int(user_id))
             initial_illusts = (
                 user_illusts_result.illusts if user_illusts_result.illusts else []
             )
@@ -756,7 +760,8 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 Pixiv API 搜索小说
-            search_result = self.client.search_novel(
+            search_result = await self._call_pixiv_api(
+                self.client.search_novel,
                 search_tags, search_target="partial_match_for_tags"
             )
             initial_novels = search_result.novels if search_result.novels else []
@@ -805,7 +810,8 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 API 获取推荐小说
-            recommend_result = self.client.novel_recommended(
+            recommend_result = await self._call_pixiv_api(
+                self.client.novel_recommended,
                 include_ranking_label=True,
                 filter="for_ios"
             )
@@ -993,7 +999,8 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 API 获取小说系列详情
-            series_result = self.client.novel_series(
+            series_result = await self._call_pixiv_api(
+                self.client.novel_series,
                 series_id=int(series_id),
                 filter="for_ios"
             )
@@ -1084,7 +1091,7 @@ class PixivSearchPlugin(Star):
         try:
             # 使用 asyncio.to_thread 包装同步 API 调用
             try:
-                comments_result = await asyncio.to_thread(
+                comments_result = await self._call_pixiv_api(
                     self.client.illust_comments,
                     illust_id=int(illust_id),
                     offset=int(offset) if offset else None,
@@ -1112,7 +1119,7 @@ class PixivSearchPlugin(Star):
                             "Authorization": f"Bearer {self.client.access_token}"
                         }
                         
-                        debug_response = requests.get(url, params=params, headers=headers)
+                        debug_response = await asyncio.to_thread(requests.get, url, params=params, headers=headers)
                         logger.error(f"Pixiv 插件：调试信息 - 原始响应状态码: {debug_response.status_code}")
                         logger.error(f"Pixiv 插件：调试信息 - 原始响应内容: {debug_response.text[:500]}")
                         
@@ -1247,7 +1254,7 @@ class PixivSearchPlugin(Star):
         try:
             # 使用 asyncio.to_thread 包装同步 API 调用
             try:
-                comments_result = await asyncio.to_thread(
+                comments_result = await self._call_pixiv_api(
                     self.client.novel_comments,
                     novel_id=int(novel_id),
                     offset=int(offset) if offset else None,
@@ -1275,7 +1282,7 @@ class PixivSearchPlugin(Star):
                             "Authorization": f"Bearer {self.client.access_token}"
                         }
                         
-                        debug_response = requests.get(url, params=params, headers=headers)
+                        debug_response = await asyncio.to_thread(requests.get, url, params=params, headers=headers)
                         logger.error(f"Pixiv 插件：调试信息 - 小说评论原始响应状态码: {debug_response.status_code}")
                         logger.error(f"Pixiv 插件：调试信息 - 小说评论原始响应内容: {debug_response.text[:500]}")
                         
@@ -1410,8 +1417,10 @@ class PixivSearchPlugin(Star):
                 return
             novel_text = novel_content_result.text
 
+            novel_text = novel_content_result.text
+
             # 生成 PDF 字节流
-            pdf_bytes = self.create_pdf_from_text(novel_title, novel_text)
+            pdf_bytes = await asyncio.to_thread(self.create_pdf_from_text, novel_title, novel_text)
             logger.info("Pixiv 插件：小说内容已成功转换为 PDF 字节流。")
 
             # 清理文件名
@@ -1513,7 +1522,8 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 API 获取新插画作品
-            new_illusts_result = self.client.illust_new(
+            new_illusts_result = await self._call_pixiv_api(
+                self.client.illust_new,
                 content_type=content_type,
                 filter="for_ios",
                 max_illust_id=int(max_illust_id) if max_illust_id else None
@@ -1581,7 +1591,8 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 API 获取新小说
-            new_novels_result = self.client.novel_new(
+            new_novels_result = await self._call_pixiv_api(
+                self.client.novel_new,
                 filter="for_ios",
                 max_novel_id=int(max_novel_id) if max_novel_id else None
             )
@@ -1637,7 +1648,8 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 API 获取趋势标签
-            result = self.client.trending_tags_illust(
+            result = await self._call_pixiv_api(
+                self.client.trending_tags_illust,
                 filter="for_ios"
             )  # 默认使用 for_ios, 也可以尝试 for_android
 
@@ -1696,7 +1708,7 @@ class PixivSearchPlugin(Star):
 
         try:
             # 使用 asyncio.to_thread 包装同步 API 调用
-            result = await asyncio.to_thread(
+            result = await self._call_pixiv_api(
                 self.client.user_edit_ai_show_settings,
                 setting=setting_str
             )
@@ -1742,7 +1754,7 @@ class PixivSearchPlugin(Star):
 
         try:
             # 调用 API 获取特辑详情（无需登录）
-            showcase_result = self.client.showcase_article(showcase_id=int(showcase_id))
+            showcase_result = await self._call_pixiv_api(self.client.showcase_article, showcase_id=int(showcase_id))
 
             if not showcase_result:
                 yield event.plain_result(f"未找到特辑 ID {showcase_id}。")
@@ -1965,7 +1977,7 @@ class PixivSearchPlugin(Star):
                     break
 
                 # 搜索当前页
-                json_result = self.client.search_illust(**next_params)
+                json_result = await self._call_pixiv_api(self.client.search_illust, **next_params)
                 if not json_result or not hasattr(json_result, "illusts"):
                     break
 
@@ -2113,7 +2125,8 @@ class PixivSearchPlugin(Star):
                         logger.debug(
                             f"Pixiv API Call (Page 1): search_illust(word='{first_tag}', search_target='partial_match_for_tags')"
                         )
-                        json_result = self.client.search_illust(
+                        json_result = await self._call_pixiv_api(
+                            self.client.search_illust,
                             first_tag, search_target="partial_match_for_tags"
                         )
                     else:
@@ -2126,7 +2139,7 @@ class PixivSearchPlugin(Star):
                         logger.debug(
                             f"Pixiv API Call (Page {current_page_num}): search_illust(**{next_params})"
                         )
-                        json_result = self.client.search_illust(**next_params)
+                        json_result = await self._call_pixiv_api(self.client.search_illust, **next_params)
 
                     # 检查 API 返回结果是否有错误字段
                     if hasattr(json_result, "error") and json_result.error:
@@ -2245,7 +2258,7 @@ class PixivSearchPlugin(Star):
 
         # 调用 Pixiv API 获取作品详情
         try:
-            illust_detail = self.client.illust_detail(illust_id)
+            illust_detail = await self._call_pixiv_api(self.client.illust_detail, illust_id)
 
             # 检查 illust_detail 和 illust 是否存在
             if (
