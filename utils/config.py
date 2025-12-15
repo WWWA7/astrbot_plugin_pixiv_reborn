@@ -75,7 +75,7 @@ class PixivConfig:
     
     def _load_config(self):
         """加载配置项"""
-        self.proxy = self.config.get("proxy", "")
+        self.proxy = self.config.get("proxy", "").strip()
         self.refresh_token = self.config.get("refresh_token", None)
         self.return_count = self.config.get("return_count", 1)
         self.r18_mode = self.config.get("r18_mode", "过滤 R18")
@@ -83,12 +83,14 @@ class PixivConfig:
         self.show_filter_result = self.config.get("show_filter_result", True)
         self.show_details = self.config.get("show_details", True)
         self.deep_search_depth = self.config.get("deep_search_depth", 3)
-        self.forward_threshold = self.config.get("forward_threshold", 5)
-        self.is_fromfilesystem = self.config.get("is_fromfilesystem", False)  # 修正默认值
+        self.forward_threshold = self.config.get("forward_threshold", False)
+        self.is_fromfilesystem = self.config.get("is_fromfilesystem", False)
         self.image_quality = self.config.get("image_quality", "original")
-        self.refresh_interval = self.config.get("refresh_token_interval_minutes", 180)  # 修正默认值
+        self.refresh_interval = self.config.get("refresh_token_interval_minutes", 180)
         self.subscription_enabled = self.config.get("subscription_enabled", True)
         self.subscription_check_interval_minutes = self.config.get("subscription_check_interval_minutes", 30)
+        self.random_search_min_interval = self.config.get("random_search_min_interval", 60)
+        self.random_search_max_interval = self.config.get("random_search_max_interval", 120)
     
     def get_auth_error_message(self) -> str:
         """获取认证错误消息"""
@@ -138,13 +140,15 @@ class PixivConfigManager:
             "show_filter_result": {"type": "bool"},
             "show_details": {"type": "bool"},
             "deep_search_depth": {"type": "int", "min": -1, "max": 50},
-            "forward_threshold": {"type": "int", "min": 1, "max": 20},
+            "forward_threshold": {"type": "bool"},
             "image_quality": {"type": "enum", "choices": ["original", "large", "medium"]},
             "subscription_enabled": {"type": "bool"},
             # 隐藏的配置项，不显示给用户但仍然可以设置
             "is_fromfilesystem": {"type": "bool", "hidden": True},
             "refresh_token_interval_minutes": {"type": "int", "min": 0, "max": 10080, "hidden": True},
             "subscription_check_interval_minutes": {"type": "int", "min": 5, "max": 1440, "hidden": True},
+            "random_search_min_interval": {"type": "int", "min": 1, "max": 1440},
+            "random_search_max_interval": {"type": "int", "min": 1, "max": 1440},
             "proxy": {"type": "string", "hidden": True},
         }
     
@@ -162,7 +166,8 @@ class PixivConfigManager:
         display_keys = [
             "return_count", "r18_mode", "ai_filter_mode", "show_filter_result",
             "show_details", "deep_search_depth", "forward_threshold",
-            "image_quality", "subscription_enabled"
+            "image_quality", "subscription_enabled", "random_search_min_interval",
+            "random_search_max_interval"
         ]
         
         current = {}

@@ -52,12 +52,10 @@
       "default": true
   },
   "forward_threshold": {
-      "description": "单次发送图片张数超过该值时自动使用消息转发",
-      "type": "int",
-      "hint": "设置为 0 时禁用转发。有效范围: 1-20，超出范围的值会被自动限制在有效范围内。",
-      "default": 5,
-      "min": 1,
-      "max": 20
+      "description": "是否启用消息转发功能",
+      "type": "bool",
+      "hint": "设置为 true 时启用转发，false 时禁用转发。启用后所有图片都会以转发消息形式发送。",
+      "default": false
   },
   "show_filter_result": {
       "description": "是否显示过滤内容提示",
@@ -109,5 +107,21 @@
       "type": "string",
       "hint": "例如 http://127.0.0.1:7890，留空则不使用代理。",
       "default": ""
+  },
+  "random_search_min_interval": {
+      "description": "随机搜索发送间隔最短时间（分钟）",
+      "type": "int",
+      "hint": "随机定时任务的最小间隔时间。单位：分钟。",
+      "default": 60,
+      "min": 1,
+      "max": 1440
+  },
+  "random_search_max_interval": {
+      "description": "随机搜索发送间隔最长时间（分钟）",
+      "type": "int",
+      "hint": "随机定时任务的最大间隔时间。单位：分钟。",
+      "default": 120,
+      "min": 1,
+      "max": 1440
   }
 }

@@ -23,7 +23,7 @@ class FilterConfig:
     logger: Optional[Callable] = None
     show_filter_result: bool = True
     excluded_tags: Optional[List[str]] = None
-    forward_threshold: int = 5
+    forward_threshold: bool = False
     show_details: bool = True
 
 def is_r18(item):
@@ -309,8 +309,9 @@ async def process_and_send_illusts(
     if not illusts_to_send:
         return
     
-    # 根据数量决定发送方式
-    if len(illusts_to_send) > config.forward_threshold:
+    # 根据配置决定发送方式
+    if config.forward_threshold:
+        # 启用转发时使用转发消息（无论图片数量多少）
         async for result in send_forward_message_func(
             client,
             event,
@@ -319,6 +320,7 @@ async def process_and_send_illusts(
         ):
             yield result
     else:
+        # 未启用转发时逐张发送
         for illust in illusts_to_send:
             detail_message = build_detail_message_func(illust, is_novel=is_novel)
             async for result in send_pixiv_image_func(

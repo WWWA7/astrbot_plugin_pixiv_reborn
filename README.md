@@ -145,7 +145,7 @@
 | `ai_filter_mode` | AI作品显示设置 | 显示 AI 作品 |
 | `deep_search_depth` | 深度搜索时搜索页数深度 | 3 |
 | `show_details` | 是否在发送图片时附带详细信息 | true |
-| `forward_threshold` | 单次发送图片张数超过该值时自动使用消息转发 | 5 |
+| `forward_threshold` | 是否启用消息转发功能（启用后所有图片都使用转发） | false |
 | `show_filter_result` | 是否显示过滤内容提示 | true |
 | `image_quality` | 默认发送的图片质量 (original/large/medium) | original |
 | `is_fromfilesystem` | 是否通过文件转发 | false |
