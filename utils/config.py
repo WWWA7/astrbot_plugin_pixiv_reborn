@@ -85,14 +85,18 @@ class PixivConfig:
         self.deep_search_depth = self.config.get("deep_search_depth", 3)
         self.forward_threshold = self.config.get("forward_threshold", False)
         self.is_fromfilesystem = self.config.get("is_fromfilesystem", False)
-        self.image_quality = self.config.get("image_quality", "original")
+        self.image_quality = self.config.get("image_quality", "medium")
         self.refresh_interval = self.config.get("refresh_token_interval_minutes", 180)
         self.subscription_enabled = self.config.get("subscription_enabled", True)
         self.subscription_check_interval_minutes = self.config.get("subscription_check_interval_minutes", 30)
         self.random_search_min_interval = self.config.get("random_search_min_interval", 60)
         self.random_search_max_interval = self.config.get("random_search_max_interval", 120)
         self.random_sent_illust_retention_days = self.config.get("random_sent_illust_retention_days", 7)
-        
+        # 新增：图片大小限制配置
+        self.image_size_limit_enabled = self.config.get("image_size_limit_enabled", True)
+        self.image_size_limit_mb = self.config.get("image_size_limit_mb", 10)
+        # 新增：平台实例名称
+        self.platform_instance_name = self.config.get("platform_instance_name", "").strip()
     
     def get_auth_error_message(self) -> str:
         """获取认证错误消息"""
@@ -111,6 +115,7 @@ class PixivConfig:
             f"ai_filter_mode='{self.ai_filter_mode}', show_details={self.show_details}, "
             f"refresh_interval={self.refresh_interval} 分钟, "
             f"subscription_enabled={self.subscription_enabled}, "
+            f"image_size_limit={'启用' if self.image_size_limit_enabled else '禁用'} ({self.image_size_limit_mb}MB), "
             f"proxy='{self.proxy or '未使用'}'"
         )
     
@@ -133,6 +138,7 @@ class PixivConfigManager:
     def __init__(self, config: PixivConfig):
         self.config = config
         self.schema = {
+            "platform_instance_name": {"type": "string"},  # 新增
             "r18_mode": {"type": "enum", "choices": ["过滤 R18", "允许 R18", "仅 R18"]},
             "ai_filter_mode": {
                 "type": "enum",
@@ -145,6 +151,9 @@ class PixivConfigManager:
             "forward_threshold": {"type": "bool"},
             "image_quality": {"type": "enum", "choices": ["original", "large", "medium"]},
             "subscription_enabled": {"type": "bool"},
+            # 新增：图片大小限制配置
+            "image_size_limit_enabled": {"type": "bool"},
+            "image_size_limit_mb": {"type": "int", "min": 1, "max": 50},
             # 隐藏的配置项，不显示给用户但仍然可以设置
             "is_fromfilesystem": {"type": "bool", "hidden": True},
             "refresh_token_interval_minutes": {"type": "int", "min": 0, "max": 10080, "hidden": True},
@@ -170,7 +179,8 @@ class PixivConfigManager:
         display_keys = [
             "return_count", "r18_mode", "ai_filter_mode", "show_filter_result",
             "show_details", "deep_search_depth", "forward_threshold",
-            "image_quality", "subscription_enabled", "random_search_min_interval",
+            "image_quality", "image_size_limit_enabled", "image_size_limit_mb",
+            "subscription_enabled", "random_search_min_interval",
             "random_search_max_interval", "random_sent_illust_retention_days"
         ]
         
