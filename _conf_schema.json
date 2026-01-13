@@ -1,4 +1,10 @@
 {
+  "platform_instance_name": {
+      "description": "平台实例名称",
+      "type": "string",
+      "hint": "用于订阅推送的平台实例名称。在 AstrBot 的平台配置中查看，例如 '喵喵ll'。如果订阅推送失败，请检查此配置。",
+      "default": ""
+  },
   "refresh_token": {
       "description": "Pixiv Refresh Token",
       "type": "string",
@@ -73,6 +79,20 @@
           "large",
           "medium"
       ]
+  },
+  "image_size_limit_enabled": {
+      "description": "是否启用图片大小限制",
+      "type": "bool",
+      "hint": "启用后，超过指定大小的图片会自动降级到较低质量。建议在使用 original 质量时开启。",
+      "default": true
+  },
+  "image_size_limit_mb": {
+      "description": "图片大小限制（MB）",
+      "type": "int",
+      "hint": "超过此大小的图片会自动降级。QQ 平台建议设置为 10MB 以下。有效范围: 1-50。",
+      "default": 10,
+      "min": 1,
+      "max": 50
   },
   "is_fromfilesystem": {
     "description": "是否通过文件转发",
