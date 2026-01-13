@@ -30,9 +30,8 @@ class SubscribeHandler:
             )
             return
 
-        platform_name = event.platform_meta.name
-        message_type = event.get_message_type().value
-        session_id = f"{platform_name}:{message_type}:{event.get_group_id() or event.get_sender_id()}"
+        # 使用 unified_msg_origin 获取正确的 session_id 格式
+        session_id = event.unified_msg_origin
 
         sub_type = "artist"
         target_name = artist_id
@@ -71,8 +70,9 @@ class SubscribeHandler:
                 f"无法获取画师ID {artist_id} 的信息，但仍会使用该ID进行订阅。"
             )
 
+        chat_id = event.get_group_id() or event.get_sender_id()
         success, message = add_subscription(
-            event.get_group_id() or event.get_sender_id(),
+            chat_id,
             session_id,
             sub_type,
             artist_id,
