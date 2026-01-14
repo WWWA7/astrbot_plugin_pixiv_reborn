@@ -158,7 +158,7 @@ class PixivSearchPlugin(Star):
         async for result in self.illust_handler.pixiv_and(event, tags):
             yield result
 
-    @command("pixiv_specific")
+    @command("pixiv_specific", alias={"pixivid","pixiv_id"})
     async def pixiv_specific(self, event: AstrMessageEvent, illust_id: str = ""):
         """根据作品 ID 获取特定作品详情"""
         async for result in self.illust_handler.pixiv_specific(event, illust_id):
