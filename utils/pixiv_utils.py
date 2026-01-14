@@ -8,8 +8,8 @@ import tempfile
 import io
 import random
 from pathlib import Path
-from typing import Any, Optional
-from PIL import Image as PILImage  # 引入 Pillow 库处理图片
+from typing import Any, Optional, List, Tuple
+from PIL import Image as PILImage
 
 from astrbot.api import logger
 from astrbot.api.message_components import Image, Plain, Node, Nodes
@@ -20,7 +20,6 @@ from .tag import filter_illusts_with_reason, FilterConfig
 from .config import smart_clean_temp_dir, clean_temp_dir
 
 
-# 全局变量，需要在模块初始化时设置
 _config = None
 _temp_dir = None
 
@@ -32,9 +31,7 @@ def init_pixiv_utils(client: AppPixivAPI, config: PixivConfig, temp_dir: Path):
 
 
 def filter_items(items, tag_label, excluded_tags=None):
-    """
-    统一过滤插画/小说的辅助方法
-    """
+    """统一过滤插画/小说的辅助方法"""
     config = FilterConfig(
         r18_mode=_config.r18_mode,
         ai_filter_mode=_config.ai_filter_mode,
@@ -55,41 +52,26 @@ def generate_safe_filename(title: str, default_name: str = "pixiv") -> str:
 
 
 def obfuscate_image_data(img_bytes: bytes) -> bytes:
-    """
-    破坏图片哈希值：
-    通过微调左上角像素颜色，改变文件 MD5，
-    有助于绕过 IM 平台的哈希黑名单（秒删）。
-    """
+    """破坏图片哈希值"""
     try:
-        # 读取图片
         img = PILImage.open(io.BytesIO(img_bytes))
         
-        # 微调：在图片左上角修改一个像素的颜色值（肉眼不可见）
         width, height = img.size
         if width > 1 and height > 1:
             pixel = list(img.getpixel((0, 0)))
-            # 针对不同模式处理 (RGB, RGBA 等)
             if isinstance(pixel, (list, tuple)) and len(pixel) >= 3:
-                # 随机增减 1，确保不越界
                 change = random.choice([-1, 1])
                 new_val = max(0, min(255, pixel[0] + change))
-                
-                # 重新构造像素元组
                 new_pixel = list(pixel)
                 new_pixel[0] = new_val
                 img.putpixel((0, 0), tuple(new_pixel))
             elif isinstance(pixel, int):
-                # 灰度图
                 change = random.choice([-1, 1])
                 img.putpixel((0, 0), max(0, min(255, pixel + change)))
 
-        # 将图片保存回 bytes
         output_buffer = io.BytesIO()
-        
-        # 获取原格式，如果没有则默认为 JPEG
         fmt = img.format if img.format else "JPEG"
         
-        # 保存时，如果是 JPEG，稍微随机化 Quality 也能大幅改变哈希
         if fmt.upper() in ["JPEG", "JPG"]:
             img.save(output_buffer, format=fmt, quality=random.randint(98, 100))
         else:
@@ -99,7 +81,56 @@ def obfuscate_image_data(img_bytes: bytes) -> bytes:
         
     except Exception as e:
         logger.warning(f"Pixiv 插件：破坏图片哈希失败 - {e}")
-        return img_bytes  # 如果处理失败，返回原图
+        return img_bytes
+
+
+def get_illust_page_urls(illust, max_pages: int = 0) -> Tuple[List[str], int, int]:
+    """
+    获取作品的所有页面URL
+    
+    Args:
+        illust: 作品对象
+        max_pages: 最大页数限制，0表示不限制
+    
+    Returns:
+        (url列表, 实际发送页数, 总页数)
+    """
+    total_pages = illust.page_count
+    
+    if total_pages == 1:
+        # 单页作品
+        original_url = None
+        if hasattr(illust, 'meta_single_page') and illust.meta_single_page:
+            original_url = getattr(illust.meta_single_page, 'original_image_url', None)
+        if not original_url:
+            original_url = getattr(illust.image_urls, _config.image_quality, None)
+            if not original_url:
+                original_url = getattr(illust.image_urls, 'large', None)
+        return [original_url] if original_url else [], 1, 1
+    
+    # 多页作品
+    urls = []
+    pages_to_send = total_pages if max_pages == 0 else min(total_pages, max_pages)
+    
+    for i in range(pages_to_send):
+        if i < len(illust.meta_pages):
+            page = illust.meta_pages[i]
+            url = getattr(page.image_urls, _config.image_quality, None)
+            if not url:
+                url = getattr(page.image_urls, 'large', None)
+            if url:
+                urls.append(url)
+    
+    return urls, pages_to_send, total_pages
+
+
+def build_page_hint(sent_pages: int, total_pages: int) -> str:
+    """构建页数提示信息"""
+    if total_pages > 1 and sent_pages < total_pages:
+        return f"\n[本作品共 {total_pages} 页，已发送前 {sent_pages} 页]"
+    elif total_pages > 1:
+        return f"\n[本作品共 {total_pages} 页]"
+    return ""
 
 
 def build_ugoira_info_message(illust, metadata, gif_info, detail_message: str = None) -> str:
@@ -122,17 +153,11 @@ def build_ugoira_info_message(illust, metadata, gif_info, detail_message: str = 
 
 
 async def download_image(session: aiohttp.ClientSession, url: str, headers: dict = None) -> Optional[bytes]:
-    """
-    下载图片数据（增强版）
-    支持自动轮询官方源和反代源。
-    逻辑：官方源(走代理) -> 反代1(直连) -> 反代2(直连) -> 失败
-    """
-    
+    """下载图片数据（增强版）"""
     default_headers = {"Referer": "https://app-api.pixiv.net/"}
     if headers:
         default_headers.update(headers)
 
-    # 仅针对 Pixiv 官方图片链接进行轮询处理
     if "i.pximg.net" not in url:
         try:
             async with session.get(url, headers=default_headers, proxy=_config.proxy or None) as response:
@@ -143,11 +168,10 @@ async def download_image(session: aiohttp.ClientSession, url: str, headers: dict
             logger.error(f"Pixiv 插件：非官方图片下载失败 - {e}")
             return None
 
-    # 定义重试列表：(域名, 是否使用配置的代理)
     sources = [
-        ("i.pximg.net", True),      # 优先级1: 官方源 (走插件配置的代理)
-        ("i.pixiv.re", False),      # 优先级2: PixivCat (直连)
-        ("i.pixivel.moe", False),   # 优先级3: Pixivel (直连)
+        ("i.pximg.net", True),
+        ("i.pixiv.re", False),
+        ("i.pixivel.moe", False),
     ]
 
     for domain, use_proxy in sources:
@@ -175,6 +199,28 @@ async def download_image(session: aiohttp.ClientSession, url: str, headers: dict
     
     logger.error(f"Pixiv 插件：所有源均下载失败，放弃下载。URL: {url}")
     return None
+
+
+async def download_illust_all_pages(session: aiohttp.ClientSession, illust, max_pages: int = 0) -> Tuple[List[bytes], int, int]:
+    """
+    下载作品的所有页面图片
+    
+    Returns:
+        (图片数据列表, 实际发送页数, 总页数)
+    """
+    urls, sent_pages, total_pages = get_illust_page_urls(illust, max_pages)
+    
+    images_data = []
+    for url in urls:
+        if url:
+            img_data = await download_image(session, url)
+            if img_data:
+                # 如果是原图质量，破坏哈希
+                if _config.image_quality == "original":
+                    img_data = await asyncio.to_thread(obfuscate_image_data, img_data)
+                images_data.append(img_data)
+    
+    return images_data, sent_pages, total_pages
 
 
 async def process_ugoira_for_content(client: AppPixivAPI, session: aiohttp.ClientSession,
@@ -230,6 +276,7 @@ async def authenticate(client: AppPixivAPI) -> bool:
         logger.error(f"Pixiv 插件：认证/刷新时发生错误 - {e}")
         return False
 
+
 async def send_pixiv_image(
     client: AppPixivAPI,
     event: Any,
@@ -238,7 +285,7 @@ async def send_pixiv_image(
     show_details: bool = True,
     send_all_pages: bool = False,
 ):
-    """通用Pixiv图片下载与发送函数"""
+    """通用Pixiv图片下载与发送函数，支持多页作品"""
     if hasattr(illust, 'type') and illust.type == 'ugoira':
         logger.info(f"Pixiv 插件：检测到动图作品 - ID: {illust.id}")
         async for result in send_ugoira(client, event, illust, detail_message):
@@ -247,61 +294,42 @@ async def send_pixiv_image(
     
     await smart_clean_temp_dir(_temp_dir, probability=0.1, max_files=20)
 
-    url_sources = []  
-    class SinglePageUrls:
-        def __init__(self, illust):
-            self.original = getattr(illust.meta_single_page, "original_image_url", None)
-            self.large = getattr(illust.image_urls, "large", None)
-            self.medium = getattr(illust.image_urls, "medium", None)
-
-    if send_all_pages and illust.page_count > 1:
-        for i, page in enumerate(illust.meta_pages):
-            page_detail = f"第 {i + 1}/{illust.page_count} 页\n{detail_message or ''}"
-            url_sources.append((page.image_urls, page_detail))
+    max_pages = _config.max_pages_per_illust if _config.max_pages_per_illust > 0 else 0
+    
+    # 如果是 send_all_pages 模式或多页作品，发送多张图
+    if send_all_pages or illust.page_count > 1:
+        async with aiohttp.ClientSession() as session:
+            images_data, sent_pages, total_pages = await download_illust_all_pages(session, illust, max_pages)
+            
+            if not images_data:
+                yield event.plain_result(f"图片下载失败（所有源均不可用），仅发送信息：\n{detail_message or ''}")
+                return
+            
+            # 构建页数提示
+            page_hint = build_page_hint(sent_pages, total_pages)
+            final_message = (detail_message or "") + page_hint
+            
+            # 构建消息：多张图片 + 详情
+            image_components = [Image.fromBytes(img_data) for img_data in images_data]
+            
+            if show_details and final_message:
+                image_components.append(Plain(final_message))
+            
+            yield event.chain_result(image_components)
     else:
-        if illust.page_count > 1:
-            url_obj = illust.meta_pages[0].image_urls
-        else:
-            url_obj = SinglePageUrls(illust)
-        url_sources.append((url_obj, detail_message))
+        # 单页作品，保持原有逻辑
+        async with aiohttp.ClientSession() as session:
+            images_data, sent_pages, total_pages = await download_illust_all_pages(session, illust, 1)
+            
+            if not images_data:
+                yield event.plain_result(f"图片下载失败（所有源均不可用），仅发送信息：\n{detail_message or ''}")
+                return
+            
+            if show_details and detail_message:
+                yield event.chain_result([Image.fromBytes(images_data[0]), Plain(detail_message)])
+            else:
+                yield event.chain_result([Image.fromBytes(images_data[0])])
 
-    for url_obj, msg in url_sources:
-        quality_preference = ["original", "large", "medium"]
-        start_index = (
-            quality_preference.index(_config.image_quality)
-            if _config.image_quality in quality_preference
-            else 0
-        )
-        qualities_to_try = quality_preference[start_index:]
-
-        image_sent_for_source = False
-        for quality in qualities_to_try:
-            image_url = getattr(url_obj, quality, None)
-            if not image_url:
-                continue
-
-            try:
-                async with aiohttp.ClientSession() as session:
-                    img_data = await download_image(session, image_url)
-                    if img_data:
-                        # ----- 新增逻辑：如果是原图，破坏哈希值 -----
-                        if quality == "original":
-                            logger.info(f"Pixiv 插件：检测到原图模式，正在破坏图片哈希值... (ID: {illust.id})")
-                            img_data = await asyncio.to_thread(obfuscate_image_data, img_data)
-                        # ------------------------------------------
-
-                        if show_details and msg:
-                            yield event.chain_result([Image.fromBytes(img_data), Plain(msg)])
-                        else:
-                            yield event.chain_result([Image.fromBytes(img_data)])
-
-                        image_sent_for_source = True
-                        break 
-            except Exception as e:
-                logger.error(f"Pixiv 插件：图片处理流程异常 (质量: {quality}) - {e}")
-
-        if not image_sent_for_source:
-            yield event.plain_result(f"图片下载失败（所有源均不可用），仅发送信息：\n{msg or ''}")
 
 async def send_ugoira(client: AppPixivAPI, event: Any, illust, detail_message: str = None):
     """处理动图（ugoira）的下载和发送"""
@@ -336,6 +364,7 @@ async def send_ugoira(client: AppPixivAPI, event: Any, illust, detail_message: s
     except Exception as e:
         logger.error(f"Pixiv 插件：处理动图时发生错误 - {e}")
         yield event.plain_result(f"处理动图时发生错误: {str(e)}")
+
 
 async def _convert_ugoira_to_gif(zip_data, metadata, safe_title, illust_id):
     """将动图ZIP文件转换为GIF格式"""
@@ -406,11 +435,14 @@ async def _convert_ugoira_to_gif(zip_data, metadata, safe_title, illust_id):
         logger.error(f"Pixiv 插件：转换动图异常 - {e}")
         return None
 
+
 async def send_forward_message(client: AppPixivAPI, event, images, build_detail_message_func):
-    """直接下载图片并组装 nodes"""
+    """直接下载图片并组装 nodes，支持多页作品"""
     batch_size = 10
     nickname = "PixivBot"
     await clean_temp_dir(_temp_dir, max_files=20)
+    
+    max_pages = _config.max_pages_per_illust if _config.max_pages_per_illust > 0 else 0
     
     for i in range(0, len(images), batch_size):
         batch_imgs = images[i : i + batch_size]
@@ -426,44 +458,24 @@ async def send_forward_message(client: AppPixivAPI, event, images, build_detail_
                         node_content = [Plain("动图处理失败")]
                 else:
                     detail_message = build_detail_message_func(img)
-                    class SinglePageUrls:
-                        def __init__(self, illust):
-                            self.original = getattr(illust.meta_single_page, "original_image_url", None)
-                            self.large = getattr(illust.image_urls, "large", None)
-                            self.medium = getattr(illust.image_urls, "medium", None)
                     
-                    if img.page_count > 1:
-                        url_obj = img.meta_pages[0].image_urls
-                    else:
-                        url_obj = SinglePageUrls(img)
-                    
-                    quality_preference = ["original", "large", "medium"]
-                    start_index = quality_preference.index(_config.image_quality) if _config.image_quality in quality_preference else 0
-                    qualities_to_try = quality_preference[start_index:]
+                    # 下载多页图片
+                    images_data, sent_pages, total_pages = await download_illust_all_pages(session, img, max_pages)
                     
                     node_content = []
-                    image_sent = False
                     
-                    for quality in qualities_to_try:
-                        image_url = getattr(url_obj, quality, None)
-                        if not image_url: continue
-                        
-                        img_data = await download_image(session, image_url)
-                        if img_data:
-                            # ----- 新增逻辑：如果是原图，破坏哈希值 -----
-                            if quality == "original":
-                                logger.info(f"Pixiv 插件：(转发) 检测到原图模式，正在破坏图片哈希值... (ID: {img.id})")
-                                img_data = await asyncio.to_thread(obfuscate_image_data, img_data)
-                            # ------------------------------------------
-
+                    if images_data:
+                        for img_data in images_data:
                             node_content.append(Image.fromBytes(img_data))
-                            image_sent = True
-                            break
-                    
-                    if not image_sent:
-                        node_content.append(Plain("图片下载失败，仅发送信息"))
-                    if _config.show_details:
-                        node_content.append(Plain(detail_message))
+                        
+                        # 添加页数提示
+                        page_hint = build_page_hint(sent_pages, total_pages)
+                        final_message = detail_message + page_hint
+                        
+                        if _config.show_details:
+                            node_content.append(Plain(final_message))
+                    else:
+                        node_content.append(Plain(f"图片下载失败，仅发送信息\n{detail_message}"))
                    
                 nodes_list.append(Node(name=nickname, content=node_content))
         if nodes_list:

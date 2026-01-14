@@ -2,14 +2,16 @@ import asyncio
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from astrbot.api import logger
-from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.api.message_components import Image, Plain, Node, Nodes
 from pixivpy3 import AppPixivAPI
 from ..utils.pixiv_utils import (
     filter_items,
-    download_image,
+    download_illust_all_pages,
+    build_page_hint,
 )
 
 from .database import get_all_subscriptions, update_last_notified_id
@@ -25,7 +27,6 @@ class SubscriptionService:
         self.scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
         self.job = None
         
-        # 定义目标文件夹路径
         log_dir = r"C:\Users\Administrator\Desktop\AstrBot\pixiv"
         
         if not os.path.exists(log_dir):
@@ -33,7 +34,6 @@ class SubscriptionService:
             
         self.log_file = os.path.join(log_dir, "pixiv_subscription.log")
         
-        # 创建专用的临时目录（避免短路径问题）
         self.temp_dir = Path(log_dir) / "temp_images"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -52,11 +52,9 @@ class SubscriptionService:
         if not self.scheduler.running:
             self._save_log("=== 订阅服务启动 ===")
             self._save_log(f"配置: image_quality={self.pixiv_config.image_quality}, "
-                          f"size_limit_enabled={self.pixiv_config.image_size_limit_enabled}, "
-                          f"size_limit_mb={self.pixiv_config.image_size_limit_mb}, "
+                          f"max_pages_per_illust={self.pixiv_config.max_pages_per_illust}, "
                           f"forward_threshold={self.pixiv_config.forward_threshold}, "
                           f"platform_instance_name={self.pixiv_config.platform_instance_name}")
-            self._save_log(f"临时目录: {self.temp_dir}")
             self.job = self.scheduler.add_job(
                 self.check_subscriptions,
                 "interval",
@@ -72,14 +70,38 @@ class SubscriptionService:
             self.scheduler.shutdown()
             logger.info("订阅检查服务已停止。")
 
+    def _fix_session_id(self, session_id: str) -> str:
+        """修复 session_id"""
+        platform_name = self.pixiv_config.platform_instance_name
+        if not platform_name:
+            return session_id
+        
+        try:
+            parts = session_id.split(":")
+            if len(parts) < 3:
+                return session_id
+            
+            platform_identifier = parts[0]
+            old_platform_types = [
+                "aiocqhttp", "onebot", "cqhttp", "gocqhttp", 
+                "napcat", "llonebot", "shamrock"
+            ]
+            
+            if platform_identifier.lower() in old_platform_types:
+                new_session_id = f"{platform_name}:{':'.join(parts[1:])}"
+                return new_session_id
+            
+            return session_id
+        except Exception as e:
+            self._save_log(f"[ERROR] 修复 session_id 时出错: {e}")
+            return session_id
+
     async def check_subscriptions(self):
         """检查所有订阅并推送更新"""
         self._save_log("开始新一轮订阅检查...")
         
         if not await self.client_wrapper.authenticate():
-            err_msg = "订阅检查失败：Pixiv API 认证失败。"
-            logger.error(err_msg)
-            self._save_log(err_msg)
+            self._save_log("订阅检查失败：Pixiv API 认证失败。")
             return
 
         subscriptions = get_all_subscriptions()
@@ -89,27 +111,49 @@ class SubscriptionService:
 
         self._save_log(f"获取到 {len(subscriptions)} 条订阅记录，开始逐个检查。")
 
+        # 收集所有新作品，按 session_id 分组
+        updates_by_session = defaultdict(list)
+        artist_updates_by_session = defaultdict(lambda: defaultdict(int))
+
         for sub in subscriptions:
             try:
                 if sub.sub_type == "artist":
-                    await self.check_artist_updates(sub)
+                    new_illusts = await self._check_artist_updates(sub)
+                    if new_illusts:
+                        session_id = self._fix_session_id(sub.session_id)
+                        for illust in new_illusts:
+                            updates_by_session[session_id].append((sub, illust))
+                            artist_updates_by_session[session_id][sub.target_name] += 1
             except Exception as e:
-                err_msg = f"检查订阅 {sub.sub_type}: {sub.target_id} 时发生错误: {e}"
-                logger.error(err_msg)
-                self._save_log(err_msg)
+                self._save_log(f"检查订阅 {sub.sub_type}: {sub.target_id} 时发生错误: {e}")
                 import traceback
                 self._save_log(traceback.format_exc())
-            await asyncio.sleep(5)
-        
+            await asyncio.sleep(2)
+
+        # 按 session_id 发送更新
+        for session_id, updates in updates_by_session.items():
+            if not updates:
+                continue
+            
+            artist_counts = artist_updates_by_session[session_id]
+            total_count = len(updates)
+            
+            self._save_log(f"准备向 {session_id} 发送 {total_count} 张新作品")
+            
+            if self.pixiv_config.forward_threshold:
+                await self._send_updates_forward(session_id, updates, artist_counts)
+            else:
+                await self._send_updates_normal(session_id, updates)
+
         self._save_log("本轮订阅检查完成。")
 
-    async def check_artist_updates(self, sub):
-        """检查画师更新"""
+    async def _check_artist_updates(self, sub) -> list:
+        """检查画师更新，返回新作品列表"""
         api: AppPixivAPI = self.client
         json_result = await asyncio.to_thread(api.user_illusts, sub.target_id)
 
         if not json_result or not json_result.illusts:
-            return
+            return []
 
         new_illusts = []
         for illust in json_result.illusts:
@@ -118,304 +162,147 @@ class SubscriptionService:
             else:
                 break
 
-        if new_illusts:
-            count = len(new_illusts)
-            new_ids = [str(i.id) for i in new_illusts]
-            self._save_log(f"画师 [{sub.target_name}] 发现 {count} 张新作品! IDs: {', '.join(new_ids)}")
-            
-            new_illusts.reverse()
-            latest_id = new_illusts[-1].id
-            
-            update_last_notified_id(sub.chat_id, sub.sub_type, sub.target_id, latest_id)
-            self._save_log(f"更新数据库 last_id -> {latest_id}")
+        if not new_illusts:
+            return []
 
-            # 过滤作品
-            filtered_illusts = []
-            for illust in new_illusts:
-                filtered, reason = filter_items([illust], f"画师订阅: {sub.target_name}")
-                if filtered:
-                    filtered_illusts.append(filtered[0])
-                else:
-                    self._save_log(f"作品 PID: {illust.id} 被过滤，原因: {reason}")
-
-            if not filtered_illusts:
-                self._save_log(f"画师 [{sub.target_name}] 的所有新作品都被过滤")
-                return
-
-            # 根据配置选择发送模式
-            if self.pixiv_config.forward_threshold:
-                # 转发模式：批量发送
-                self._save_log(f"使用转发模式发送 {len(filtered_illusts)} 张作品")
-                await self.send_update_forward(sub, filtered_illusts)
-            else:
-                # 普通模式：逐张发送
-                for illust in filtered_illusts:
-                    self._save_log(f"准备推送作品 PID: {illust.id} -> 会话: {sub.session_id}")
-                    await self.send_update(sub, illust)
-                    await asyncio.sleep(2)
-
-    def _fix_session_id(self, session_id: str) -> str:
-        """
-        修复 session_id，将旧格式的平台类型转换为配置的平台实例名称
-        例如：aiocqhttp:GroupMessage:123 -> 喵喵ll:GroupMessage:123
-        """
-        # 如果没有配置平台实例名称，直接返回原始值
-        platform_name = self.pixiv_config.platform_instance_name
-        if not platform_name:
-            self._save_log(f"[WARN] 未配置 platform_instance_name，使用原始 session_id")
-            return session_id
+        new_ids = [str(i.id) for i in new_illusts]
+        self._save_log(f"画师 [{sub.target_name}] 发现 {len(new_illusts)} 张新作品! IDs: {', '.join(new_ids)}")
         
-        try:
-            parts = session_id.split(":")
-            if len(parts) < 3:
-                return session_id
-            
-            platform_identifier = parts[0]
-            
-            # 需要转换的旧格式平台类型列表
-            old_platform_types = [
-                "aiocqhttp", "onebot", "cqhttp", "gocqhttp", 
-                "napcat", "llonebot", "shamrock"
-            ]
-            
-            # 检查是否是旧格式（平台类型而非实例名称）
-            if platform_identifier.lower() in old_platform_types:
-                # 替换为配置的平台实例名称
-                new_session_id = f"{platform_name}:{':'.join(parts[1:])}"
-                self._save_log(f"[DEBUG] 转换 session_id: {session_id} -> {new_session_id}")
-                return new_session_id
-            
-            return session_id
-            
-        except Exception as e:
-            self._save_log(f"[ERROR] 修复 session_id 时出错: {e}")
-            return session_id
+        new_illusts.reverse()
+        latest_id = new_illusts[-1].id
+        update_last_notified_id(sub.chat_id, sub.sub_type, sub.target_id, latest_id)
+        self._save_log(f"更新数据库 last_id -> {latest_id}")
 
-    async def send_update_forward(self, sub, illusts: list):
-        """使用转发模式发送多张作品"""
+        # 过滤作品
+        filtered_illusts = []
+        for illust in new_illusts:
+            filtered, reason = filter_items([illust], f"画师订阅: {sub.target_name}")
+            if filtered:
+                filtered_illusts.append(filtered[0])
+            else:
+                self._save_log(f"作品 PID: {illust.id} 被过滤，原因: {reason}")
+
+        return filtered_illusts
+
+    async def _send_updates_forward(self, session_id: str, updates: list, artist_counts: dict):
+        """转发模式：先发送提示消息，再发送合并的转发消息"""
         import aiohttp
         
         try:
-            session_id_str = sub.session_id
-            session_id_str = self._fix_session_id(session_id_str)
-            self._save_log(f"[DEBUG] 转发模式: 使用 session_id: {session_id_str}")
+            # 1. 构建并发送提示消息
+            total_count = len(updates)
+            artist_info_list = [f"{name} ({count}张)" for name, count in artist_counts.items()]
+            artist_info_str = "、".join(artist_info_list)
             
+            notify_message = f"您订阅的画师有新作品更新啦！\n画师: {artist_info_str}\n共 {total_count} 张新作品"
+            
+            notify_chain = MessageChain().message(notify_message)
+            result = await self.context.send_message(session_id, notify_chain)
+            
+            if result:
+                self._save_log(f"提示消息发送成功")
+            else:
+                self._save_log(f"[WARN] 提示消息发送失败")
+            
+            await asyncio.sleep(1)
+            
+            # 2. 构建转发消息
             nodes_list = []
-            nickname = "Pixiv订阅推送"
+            nickname = "Pixiv订阅"
+            max_pages = self.pixiv_config.max_pages_per_illust if self.pixiv_config.max_pages_per_illust > 0 else 0
             
             async with aiohttp.ClientSession() as session:
-                for illust in illusts:
+                for sub, illust in updates:
                     # 构建详情消息
-                    detail_message = (
-                        f"您订阅的画师 [{sub.target_name}] 有新作品啦！\n"
-                    )
+                    detail_message = f"画师: {sub.target_name}\n"
                     detail_message += build_detail_message(illust, is_novel=False)
                     
-                    # 获取图片
-                    img_data = await self._download_illust_image(session, illust)
+                    # 下载多页图片
+                    images_data, sent_pages, total_pages = await download_illust_all_pages(session, illust, max_pages)
                     
-                    if img_data:
-                        node_content = [Image.fromBytes(img_data)]
+                    node_content = []
+                    
+                    if images_data:
+                        for img_data in images_data:
+                            node_content.append(Image.fromBytes(img_data))
+                        
+                        # 添加页数提示
+                        page_hint = build_page_hint(sent_pages, total_pages)
+                        final_message = detail_message + page_hint
+                        
                         if self.pixiv_config.show_details:
-                            node_content.append(Plain(detail_message))
+                            node_content.append(Plain(final_message))
                     else:
                         node_content = [Plain(f"[图片下载失败]\n{detail_message}")]
                     
                     nodes_list.append(Node(name=nickname, content=node_content))
-                    self._save_log(f"[DEBUG] 已添加作品 PID: {illust.id} 到转发列表")
+                    self._save_log(f"[DEBUG] 已添加作品 PID: {illust.id} ({sent_pages}/{total_pages}页) 到转发列表")
             
             if nodes_list:
-                # 构建转发消息
-                from astrbot.core.message.message_event_result import MessageEventResult
+                forward_result = MessageEventResult()
+                forward_result.chain = [Nodes(nodes=nodes_list)]
+                forward_result.use_t2i = False
                 
-                result = MessageEventResult()
-                result.chain = [Nodes(nodes=nodes_list)]
-                result.use_t2i = False
-                
-                send_result = await self.context.send_message(session_id_str, result)
+                send_result = await self.context.send_message(session_id, forward_result)
                 
                 if send_result:
-                    self._save_log(f"转发推送成功: 共 {len(nodes_list)} 张作品")
+                    self._save_log(f"转发消息发送成功: 共 {len(nodes_list)} 张作品")
                 else:
-                    self._save_log(f"[ERROR] 转发推送失败: send_message 返回 False")
+                    self._save_log(f"[ERROR] 转发消息发送失败: send_message 返回 False")
             else:
                 self._save_log(f"[WARN] 没有可发送的作品")
                 
         except Exception as e:
-            err_msg = f"转发模式发送失败: {e}"
-            logger.error(err_msg)
-            self._save_log(err_msg)
+            self._save_log(f"转发模式发送失败: {e}")
             import traceback
             self._save_log(traceback.format_exc())
 
-    async def _download_illust_image(self, session, illust) -> bytes:
-        """下载作品图片，返回图片数据"""
-        try:
-            # 获取图片URL对象
-            if illust.page_count > 1 and illust.meta_pages:
-                url_obj = illust.meta_pages[0].image_urls
-            else:
-                url_obj = illust.image_urls
-            
-            # 按质量优先级获取URL并下载
-            quality_preference = ["original", "large", "medium"]
-            start_index = (
-                quality_preference.index(self.pixiv_config.image_quality)
-                if self.pixiv_config.image_quality in quality_preference
-                else 0
-            )
-            
-            size_limit_mb = self.pixiv_config.image_size_limit_mb
-            size_limit_enabled = self.pixiv_config.image_size_limit_enabled
-            
-            for quality in quality_preference[start_index:]:
-                image_url = None
-                
-                # 修复：正确获取原图URL
-                if quality == 'original':
-                    if hasattr(illust, 'meta_single_page') and illust.meta_single_page:
-                        image_url = getattr(illust.meta_single_page, 'original_image_url', None)
-                    if not image_url and hasattr(url_obj, 'original'):
-                        image_url = getattr(url_obj, 'original', None)
-                else:
-                    if hasattr(url_obj, quality):
-                        image_url = getattr(url_obj, quality, None)
+    async def _send_updates_normal(self, session_id: str, updates: list):
+        """普通模式：逐张发送"""
+        for sub, illust in updates:
+            await self._send_single_update(session_id, sub, illust)
+            await asyncio.sleep(2)
 
-                if not image_url:
-                    continue
-
-                downloaded_data = await download_image(session, image_url)
-                
-                if downloaded_data:
-                    size_mb = len(downloaded_data) / (1024 * 1024)
-                    
-                    if size_limit_enabled and size_mb > size_limit_mb and quality != "medium":
-                        self._save_log(f"[DEBUG] PID {illust.id}: 质量 {quality} 大小 {size_mb:.2f}MB 超限，降级")
-                        continue
-                    
-                    self._save_log(f"[DEBUG] PID {illust.id}: 使用质量 {quality}，大小 {size_mb:.2f}MB")
-                    return downloaded_data
-            
-            return None
-            
-        except Exception as e:
-            self._save_log(f"[ERROR] 下载图片失败 PID {illust.id}: {e}")
-            return None
-
-    async def send_update(self, sub, illust):
-        """发送更新通知（普通模式）"""
+    async def _send_single_update(self, session_id: str, sub, illust):
+        """发送单张作品（普通模式），支持多页"""
         import aiohttp
         
         tmp_path = None
         try:
-            session_id_str = sub.session_id
-            
-            # 修复：使用配置的平台实例名称转换 session_id
-            session_id_str = self._fix_session_id(session_id_str)
-            self._save_log(f"[DEBUG] PID {illust.id}: 使用 session_id: {session_id_str}")
-            
-            # 构建详情消息
-            detail_message = (
-                f"您订阅的画师 [{sub.target_name}] 有新作品啦！\n"
-            )
+            detail_message = f"您订阅的画师 [{sub.target_name}] 有新作品啦！\n"
             detail_message += build_detail_message(illust, is_novel=False)
 
-            # 获取图片URL对象
-            if illust.page_count > 1 and illust.meta_pages:
-                url_obj = illust.meta_pages[0].image_urls
-            else:
-                url_obj = illust.image_urls
-            
-            # 按质量优先级获取URL并下载
-            quality_preference = ["original", "large", "medium"]
-            start_index = (
-                quality_preference.index(self.pixiv_config.image_quality)
-                if self.pixiv_config.image_quality in quality_preference
-                else 0
-            )
-            
-            img_data = None
-            size_limit_mb = self.pixiv_config.image_size_limit_mb
-            size_limit_enabled = self.pixiv_config.image_size_limit_enabled
-            
-            self._save_log(f"[DEBUG] PID {illust.id}: 开始下载图片, page_count={illust.page_count}")
-            
+            max_pages = self.pixiv_config.max_pages_per_illust if self.pixiv_config.max_pages_per_illust > 0 else 0
+
             async with aiohttp.ClientSession() as session:
-                for quality in quality_preference[start_index:]:
-                    image_url = None
-                    
-                    # 修复：正确获取原图URL
-                    if quality == 'original':
-                        # 对于单页作品，原图URL在 meta_single_page 中
-                        if hasattr(illust, 'meta_single_page') and illust.meta_single_page:
-                            image_url = getattr(illust.meta_single_page, 'original_image_url', None)
-                        # 对于多页作品，原图URL在 url_obj.original 中
-                        if not image_url and hasattr(url_obj, 'original'):
-                            image_url = getattr(url_obj, 'original', None)
-                    else:
-                        # large 和 medium 直接从 url_obj 获取
-                        if hasattr(url_obj, quality):
-                            image_url = getattr(url_obj, quality, None)
+                images_data, sent_pages, total_pages = await download_illust_all_pages(session, illust, max_pages)
 
-                    if not image_url:
-                        self._save_log(f"[DEBUG] PID {illust.id}: 质量 {quality} 无URL，跳过")
-                        continue
-
-                    self._save_log(f"[DEBUG] PID {illust.id}: 尝试下载质量 {quality}")
-                    downloaded_data = await download_image(session, image_url)
-                    
-                    if downloaded_data:
-                        size_mb = len(downloaded_data) / (1024 * 1024)
-                        self._save_log(f"[DEBUG] PID {illust.id}: 质量 {quality} 下载成功，大小 {size_mb:.2f}MB")
-                        
-                        if size_limit_enabled and size_mb > size_limit_mb and quality != "medium":
-                            self._save_log(f"图片 PID {illust.id} 大小 {size_mb:.2f}MB 超限，尝试降级")
-                            continue
-                        
-                        img_data = downloaded_data
-                        self._save_log(f"图片 PID {illust.id} 最终使用质量 {quality}，大小 {size_mb:.2f}MB")
-                        break
-                    else:
-                        self._save_log(f"[DEBUG] PID {illust.id}: 质量 {quality} 下载失败")
-
-            if not img_data:
+            if not images_data:
                 self._save_log(f"[ERROR] PID {illust.id}: 所有质量下载失败")
                 return
 
-            # 保存到临时文件
-            tmp_path = str(self.temp_dir / f"pixiv_{illust.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg")
-            with open(tmp_path, 'wb') as f:
-                f.write(img_data)
+            # 添加页数提示
+            page_hint = build_page_hint(sent_pages, total_pages)
+            final_message = detail_message + page_hint
+
+            # 构建消息：多张图片 + 详情
+            from astrbot.core.message.message_event_result import MessageEventResult
             
-            file_size = os.path.getsize(tmp_path)
-            self._save_log(f"[DEBUG] PID {illust.id}: 文件已保存到 {tmp_path}，大小 {file_size} 字节")
-            
-            # 构建消息链
+            result_obj = MessageEventResult()
+            result_obj.chain = [Image.fromBytes(img_data) for img_data in images_data]
+            if self.pixiv_config.show_details
             if self.pixiv_config.show_details:
-                message_chain = MessageChain().file_image(tmp_path).message(detail_message)
-            else:
-                message_chain = MessageChain().file_image(tmp_path)
+                result_obj.chain.append(Plain(final_message))
+            result_obj.use_t2i = False
             
-            # 发送消息
-            result = await self.context.send_message(session_id_str, message_chain)
+            result = await self.context.send_message(session_id, result_obj)
             
             if result:
-                self._save_log(f"推送成功: PID {illust.id}")
+                self._save_log(f"推送成功: PID {illust.id} ({sent_pages}/{total_pages}页)")
             else:
-                self._save_log(f"[ERROR] PID {illust.id}: send_message 返回 False，请检查 platform_instance_name 配置")
+                self._save_log(f"[ERROR] PID {illust.id}: send_message 返回 False")
 
         except Exception as e:
-            err_msg = f"发送订阅更新时出错 (PID {illust.id}): {e}"
-            logger.error(err_msg)
-            self._save_log(err_msg)
+            self._save_log(f"发送订阅更新时出错 (PID {illust.id}): {e}")
             import traceback
-            logger.error(traceback.format_exc())
             self._save_log(traceback.format_exc())
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    await asyncio.sleep(3)
-                    os.remove(tmp_path)
-                    self._save_log(f"[DEBUG] PID {illust.id}: 临时文件已清理")
-                except Exception as e:
-                    self._save_log(f"[DEBUG] 清理临时文件失败: {e}")

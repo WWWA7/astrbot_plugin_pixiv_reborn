@@ -5,7 +5,8 @@ import tempfile
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from astrbot.api import logger
-from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
+from astrbot.api.message_components import Image, Plain
 
 from .database import (
     get_all_random_search_groups,
@@ -27,7 +28,7 @@ from .tag import (
     filter_illusts_with_reason,
     sample_illusts,
 )
-from .pixiv_utils import download_image
+from .pixiv_utils import download_illust_all_pages, build_page_hint
 import aiohttp
 
 
@@ -61,8 +62,7 @@ class RandomSearchService:
             self.scheduler.start()
             logger.info("Pixiv 随机搜索服务已启动。")
             logger.info(f"配置: image_quality={self.pixiv_config.image_quality}, "
-                       f"size_limit_enabled={self.pixiv_config.image_size_limit_enabled}, "
-                       f"size_limit_mb={self.pixiv_config.image_size_limit_mb}")
+                       f"max_pages_per_illust={self.pixiv_config.max_pages_per_illust}")
             self._load_existing_schedules()
 
     def _load_existing_schedules(self):
@@ -81,7 +81,7 @@ class RandomSearchService:
             logger.info("Pixiv 随机搜索服务已停止。")
 
     async def _scheduler_tick(self):
-        """检查是否有群组需要执行搜索，并将其加入队列。"""
+        """检查是否有群组需要执行搜索"""
         if not self.client:
             return
 
@@ -130,7 +130,7 @@ class RandomSearchService:
             logger.error(f"RandomSearchService 调度器 tick 出错: {e}")
 
     async def _task_queue_processor(self):
-        """任务队列处理器，按顺序执行队列中的搜索任务。"""
+        """任务队列处理器"""
         logger.info("RandomSearchService 任务队列处理器开始运行")
 
         while True:
@@ -174,7 +174,7 @@ class RandomSearchService:
                 await asyncio.sleep(5)
 
     async def _cleanup_task(self):
-        """定期清理过期记录的任务"""
+        """定期清理过期记录"""
         try:
             logger.info("开始清理过期的已发送作品记录...")
             days = self.pixiv_config.random_sent_illust_retention_days
@@ -184,7 +184,7 @@ class RandomSearchService:
             logger.error(f"清理过期记录任务出错: {e}")
 
     async def execute_search_for_group(self, chat_id: str):
-        """为特定群组执行随机搜索（标签或排行榜）"""
+        """为特定群组执行随机搜索"""
         tags = get_random_tags(chat_id)
         rankings = get_random_rankings(chat_id)
 
@@ -253,9 +253,6 @@ class RandomSearchService:
                 if current_illusts:
                     all_illusts.extend(current_illusts)
                     page_count += 1
-                    logger.info(
-                        f"标签 {raw_tag} 的随机搜索：已获取第 {page_count} 页，找到 {len(current_illusts)} 个插画"
-                    )
                 else:
                     break
 
@@ -268,11 +265,6 @@ class RandomSearchService:
             if not all_illusts:
                 logger.info(f"标签 {raw_tag} 的随机搜索未返回结果。")
                 return
-
-            initial_count = len(all_illusts)
-            logger.info(
-                f"标签 {raw_tag} 的随机搜索完成，共获取 {page_count} 页，找到 {initial_count} 个插画，开始过滤处理..."
-            )
 
             initial_illusts = filter_sent_illusts(all_illusts, chat_id)
 
@@ -313,9 +305,7 @@ class RandomSearchService:
         date = ranking_config.date
         session_id = ranking_config.session_id
 
-        logger.info(
-            f"正在为群组 {chat_id} 执行随机排行榜搜索，模式: {mode}, 日期: {date}"
-        )
+        logger.info(f"正在为群组 {chat_id} 执行随机排行榜搜索，模式: {mode}")
 
         if not await self.client_wrapper.authenticate():
             logger.error(f"群组 {chat_id} 的随机排行榜搜索失败: 认证失败。")
@@ -365,11 +355,7 @@ class RandomSearchService:
             logger.error(f"为群组 {chat_id} 执行随机排行榜搜索时出错: {e}")
 
     def _fix_session_id(self, session_id: str) -> str:
-        """
-        修复 session_id，将旧格式的平台类型转换为配置的平台实例名称
-        例如：aiocqhttp:GroupMessage:123 -> 喵喵ll:GroupMessage:123
-        """
-        # 如果没有配置平台实例名称，直接返回原始值
+        """修复 session_id"""
         platform_name = self.pixiv_config.platform_instance_name
         if not platform_name:
             return session_id
@@ -380,200 +366,61 @@ class RandomSearchService:
                 return session_id
             
             platform_identifier = parts[0]
-            
-            # 需要转换的旧格式平台类型列表
             old_platform_types = [
                 "aiocqhttp", "onebot", "cqhttp", "gocqhttp", 
                 "napcat", "llonebot", "shamrock"
             ]
             
-            # 检查是否是旧格式（平台类型而非实例名称）
             if platform_identifier.lower() in old_platform_types:
-                # 替换为配置的平台实例名称
                 new_session_id = f"{platform_name}:{':'.join(parts[1:])}"
                 logger.debug(f"转换 session_id: {session_id} -> {new_session_id}")
                 return new_session_id
             
             return session_id
-            
         except Exception as e:
             logger.error(f"修复 session_id 时出错: {e}")
             return session_id
 
     async def _send_illust(self, session_id: str, illust, chat_id: str):
-        """发送单个作品到指定会话，支持图片大小限制和自动降级"""
-        tmp_path = None
+        """发送单个作品，支持多页"""
         try:
-            # 修复：转换 session_id
             session_id = self._fix_session_id(session_id)
             
             detail_message = build_detail_message(illust, is_novel=False)
-
-            if illust.page_count > 1 and illust.meta_pages:
-                url_obj = illust.meta_pages[0].image_urls
-            else:
-                url_obj = illust.image_urls
-
-            quality_preference = ["original", "large", "medium"]
-            start_index = (
-                quality_preference.index(self.pixiv_config.image_quality)
-                if self.pixiv_config.image_quality in quality_preference
-                else 0
-            )
-
-            img_data = None
-            used_quality = None
-            size_limit_mb = self.pixiv_config.image_size_limit_mb
-            size_limit_enabled = self.pixiv_config.image_size_limit_enabled
-
-            logger.debug(f"[RandomSearch] PID {illust.id}: size_limit_enabled={size_limit_enabled}, size_limit_mb={size_limit_mb}")
+            max_pages = self.pixiv_config.max_pages_per_illust if self.pixiv_config.max_pages_per_illust > 0 else 0
 
             async with aiohttp.ClientSession() as session:
-                for quality in quality_preference[start_index:]:
-                    image_url = None
+                images_data, sent_pages, total_pages = await download_illust_all_pages(session, illust, max_pages)
 
-                    # 修复：正确获取原图URL
-                    if quality == 'original':
-                        # 对于单页作品，原图URL在 meta_single_page 中
-                        if hasattr(illust, 'meta_single_page') and illust.meta_single_page:
-                            image_url = getattr(illust.meta_single_page, 'original_image_url', None)
-                        # 对于多页作品，原图URL在 url_obj.original 中
-                        if not image_url and hasattr(url_obj, 'original'):
-                            image_url = getattr(url_obj, 'original', None)
-                    else:
-                        # large 和 medium 直接从 url_obj 获取
-                        if hasattr(url_obj, quality):
-                            image_url = getattr(url_obj, quality, None)
-
-                    if not image_url:
-                        logger.debug(f"[RandomSearch] PID {illust.id}: 质量 {quality} 无URL，跳过")
-                        continue
-
-                    logger.debug(f"[RandomSearch] PID {illust.id}: 尝试下载质量 {quality}")
-                    downloaded_data = await download_image(session, image_url)
-
-                    if downloaded_data:
-                        size_mb = len(downloaded_data) / (1024 * 1024)
-                        logger.debug(f"[RandomSearch] PID {illust.id}: 质量 {quality} 下载成功，大小 {size_mb:.2f}MB")
-
-                        if size_limit_enabled and size_mb > size_limit_mb and quality != "medium":
-                            logger.warning(
-                                f"图片 PID {illust.id} 质量 {quality} 大小 {size_mb:.2f}MB 超过限制 {size_limit_mb}MB，尝试降级"
-                            )
-                            continue
-
-                        img_data = downloaded_data
-                        used_quality = quality
-                        logger.info(f"图片 PID {illust.id} 最终使用质量 {quality}，大小 {size_mb:.2f}MB")
-                        break
-                    else:
-                        logger.debug(f"[RandomSearch] PID {illust.id}: 质量 {quality} 下载失败")
-
-            # 发送消息
-            if img_data:
-                # 方案1：尝试使用 Image.fromBytes 直接发送
-                try:
-                    from astrbot.api.message_components import Image, Plain
-                    from astrbot.core.message.message_event_result import MessageEventResult
-                    
-                    logger.debug(f"[RandomSearch] PID {illust.id}: 尝试方案1 - Image.fromBytes")
-                    
-                    chain_components = [Image.fromBytes(img_data)]
-                    if self.pixiv_config.show_details:
-                        chain_components.append(Plain(detail_message))
-                    
-                    result = MessageEventResult()
-                    result.chain = chain_components
-                    result.use_t2i = False
-                    
-                    send_result = await self.context.send_message(session_id, result)
-                    
-                    if send_result:
-                        logger.info(f"随机搜索：已发送作品 PID {illust.id} 到 {session_id}")
-                        add_sent_illust(illust.id, chat_id)
-                        return
-                    else:
-                        logger.warning(f"[RandomSearch] PID {illust.id}: 方案1 返回 False")
-                    
-                except Exception as e1:
-                    logger.warning(f"[RandomSearch] PID {illust.id}: 方案1失败 - {e1}")
-                
-                # 方案2：保存到临时文件后使用 file_image
-                try:
-                    logger.debug(f"[RandomSearch] PID {illust.id}: 尝试方案2 - file_image")
-                    
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
-                        tmp_file.write(img_data)
-                        tmp_path = tmp_file.name
-                    
-                    logger.debug(f"[RandomSearch] PID {illust.id}: 图片已保存到 {tmp_path}，文件大小 {os.path.getsize(tmp_path)} 字节")
-                    
-                    if self.pixiv_config.show_details:
-                        message_chain = MessageChain().file_image(tmp_path).message(detail_message)
-                    else:
-                        message_chain = MessageChain().file_image(tmp_path)
-                    
-                    send_result = await self.context.send_message(session_id, message_chain)
-                    
-                    if send_result:
-                        logger.info(f"随机搜索：已发送作品 PID {illust.id} 到 {session_id}")
-                        add_sent_illust(illust.id, chat_id)
-                        return
-                    else:
-                        logger.warning(f"[RandomSearch] PID {illust.id}: 方案2 返回 False")
-                    
-                except Exception as e2:
-                    logger.warning(f"[RandomSearch] PID {illust.id}: 方案2失败 - {e2}")
-                
-                # 方案3：使用 base64 URI
-                try:
-                    import base64
-                    logger.debug(f"[RandomSearch] PID {illust.id}: 尝试方案3 - base64")
-                    
-                    img_base64 = base64.b64encode(img_data).decode('utf-8')
-                    base64_uri = f"base64://{img_base64}"
-                    
-                    message_chain = MessageChain().image(base64_uri)
-                    if self.pixiv_config.show_details:
-                        message_chain = message_chain.message(detail_message)
-                    
-                    send_result = await self.context.send_message(session_id, message_chain)
-                    
-                    if send_result:
-                        logger.info(f"随机搜索：已发送作品 PID {illust.id} 到 {session_id}")
-                        add_sent_illust(illust.id, chat_id)
-                        return
-                    else:
-                        logger.warning(f"[RandomSearch] PID {illust.id}: 方案3 返回 False")
-                    
-                except Exception as e3:
-                    logger.error(f"[RandomSearch] PID {illust.id}: 方案3失败 - {e3}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                
-                # 所有方案都失败，仅发送文本
-                logger.error(f"[RandomSearch] PID {illust.id}: 所有发送方案都失败，仅发送文本")
-                message_chain = MessageChain().message(f"[图片发送失败]\n{detail_message}")
-                await self.context.send_message(session_id, message_chain)
-                add_sent_illust(illust.id, chat_id)
-                
-            else:
+            if not images_data:
                 logger.warning(f"[RandomSearch] PID {illust.id}: 所有质量下载失败，仅发送文本")
-                message_chain = MessageChain().message(f"[图片下载失败或过大]\n{detail_message}")
+                message_chain = MessageChain().message(f"[图片下载失败]\n{detail_message}")
                 await self.context.send_message(session_id, message_chain)
+                return
+
+            # 添加页数提示
+            page_hint = build_page_hint(sent_pages, total_pages)
+            final_message = detail_message + page_hint
+
+            # 构建消息
+            result_obj = MessageEventResult()
+            result_obj.chain = [Image.fromBytes(img_data) for img_data in images_data]
+            if self.pixiv_config.show_details:
+                result_obj.chain.append(Plain(final_message))
+            result_obj.use_t2i = False
+
+            send_result = await self.context.send_message(session_id, result_obj)
+
+            if send_result:
+                logger.info(f"随机搜索：已发送作品 PID {illust.id} ({sent_pages}/{total_pages}页) 到 {session_id}")
+                add_sent_illust(illust.id, chat_id)
+            else:
+                logger.warning(f"[RandomSearch] PID {illust.id}: send_message 返回 False")
 
         except Exception as e:
             logger.error(f"发送作品 PID {illust.id} 时出错: {e}")
             import traceback
             logger.error(traceback.format_exc())
-        finally:
-            # 清理临时文件
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                    logger.debug(f"[RandomSearch] PID {illust.id}: 临时文件已清理")
-                except Exception as e:
-                    logger.warning(f"清理临时文件失败: {e}")
 
     def suspend_group_search(self, chat_id: str):
         """暂停指定群组的随机搜索"""
@@ -600,7 +447,7 @@ class RandomSearchService:
             logger.error(f"恢复群组 {chat_id} 调度时间失败: {e}")
 
     def get_queue_status(self) -> dict:
-        """获取队列状态信息，用于调试和监控"""
+        """获取队列状态信息"""
         return {
             "queue_size": self.task_queue.qsize(),
             "is_queue_processor_running": self.is_queue_processor_running,
@@ -611,7 +458,7 @@ class RandomSearchService:
         }
 
     async def force_execute_group(self, chat_id: str) -> bool:
-        """强制执行指定群组的随机搜索（用于调试）"""
+        """强制执行指定群组的随机搜索"""
         if chat_id not in self.execution_locks:
             self.execution_locks[chat_id] = False
 

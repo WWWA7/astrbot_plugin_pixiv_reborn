@@ -5,6 +5,14 @@
       "hint": "用于订阅推送的平台实例名称。在 AstrBot 的平台配置中查看，例如 '喵喵ll'。如果订阅推送失败，请检查此配置。",
       "default": ""
   },
+  "max_pages_per_illust": {
+      "description": "单个作品最多发送页数",
+      "type": "int",
+      "hint": "多页作品最多发送几张图。设置为 0 表示不限制，全部发送。有效范围: 0-50。",
+      "default": 10,
+      "min": 0,
+      "max": 50
+  },
   "refresh_token": {
       "description": "Pixiv Refresh Token",
       "type": "string",
