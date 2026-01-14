@@ -267,7 +267,6 @@ class SubscriptionService:
         """发送单张作品（普通模式），支持多页"""
         import aiohttp
         
-        tmp_path = None
         try:
             detail_message = f"您订阅的画师 [{sub.target_name}] 有新作品啦！\n"
             detail_message += build_detail_message(illust, is_novel=False)
@@ -286,11 +285,8 @@ class SubscriptionService:
             final_message = detail_message + page_hint
 
             # 构建消息：多张图片 + 详情
-            from astrbot.core.message.message_event_result import MessageEventResult
-            
             result_obj = MessageEventResult()
             result_obj.chain = [Image.fromBytes(img_data) for img_data in images_data]
-            if self.pixiv_config.show_details
             if self.pixiv_config.show_details:
                 result_obj.chain.append(Plain(final_message))
             result_obj.use_t2i = False
